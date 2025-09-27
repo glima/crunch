@@ -16,6 +16,32 @@ c̶a̶r̶g̶o̶crunch clippy --workspace
 c̶a̶r̶g̶o̶crunch t -p sys-internals
 ```
 
+### Remote Build Paths with `--remote-path`
+
+By default, `crunch` mirrors your local directory structure on the
+remote server (`--remote-path mirror`). You can also choose
+alternative behaviors:
+
+**Temporary builds** (`--remote-path tmp`): Creates builds in
+temporary directories that are automatically cleaned up after
+completion:
+
+```bash
+crunch --remote-path tmp build --release
+```
+
+**Unique persistent builds** (`--remote-path unique`): Creates a
+dedicated directory in `~/crunch-builds/<project-name>` that persists
+across builds, similar to `cargo-remote`:
+
+```bash
+crunch --remote-path unique build --release
+```
+
+The temporary approach avoids filesystem assumptions at the cost of
+more bandwidth usage. The unique approach provides persistent build
+artifacts while keeping projects isolated.
+
 ## Installation
 
 ```bash
@@ -102,6 +128,16 @@ Options:
           Path or directory to sync back from the remote server after all other work has been done. Each entry should be in the format `source:destination`. Specify multiple entries using delimiter ','.
 
           Example: `--copy-back "./target/release/cuter-cat.png:.,*.bin:~/my-bins"`
+
+      --remote-path <REMOTE_PATH>
+          Specify the remote path behavior for builds
+
+          [default: mirror]
+
+          Possible values:
+          - mirror: Mirror the local directory structure on the remote server (default)
+          - tmp:    Use a temporary directory that is cleaned up after the build
+          - unique: Use a unique persistent directory in the user's home directory for each project
 
   -h, --help
           Print help (see a summary with '-h')

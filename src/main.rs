@@ -2,13 +2,14 @@
 //!
 //! crunch seamlessly integrates cutting-edge hardware into your local development environment.
 
-use clap::{command, Parser};
+use clap::{command, Parser, ValueEnum};
 use env_logger;
 use log::{debug, error, info};
 use std::{
     process::{exit, Command, Stdio},
     sync::{Arc, Mutex},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,16 @@ pub struct Remote {
     pub ssh_port: u16,
     pub temp_dir: String,
     pub env: String,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum RemotePathBehavior {
+    /// Mirror the local directory structure on the remote server (default)
+    Mirror,
+    /// Use a temporary directory on the remote server that cleans up afterwards
+    Tmp,
+    /// Use a unique persistent directory in the user's home directory for each project
+    Unique,
 }
 
 #[derive(Parser, Debug)]
@@ -63,6 +74,10 @@ struct Args {
     /// Example: `--copy-back "./target/release/cuter-cat.png:.,*.bin:~/my-bins"`
     #[arg(long = "copy-back", required = false, value_delimiter = ',')]
     copy_back: Vec<String>,
+
+    /// Specify the remote path behavior for builds
+    #[arg(long = "remote-path", required = false, default_value = "mirror")]
+    remote_path: RemotePathBehavior,
 
     /// The cargo command to execute
     ///
@@ -120,7 +135,44 @@ fn main() {
 
     let build_server = remote.host;
 
-    let build_path = project_dir.clone();
+    let build_path = match args.remote_path {
+        RemotePathBehavior::Tmp => {
+            // Generate UID locally to avoid RTT latency
+            let project_name = project_dir.file_name().unwrap_or_else(|| {
+                error!(
+                    "Could not determine project name from workspace root: {}",
+                    project_dir
+                );
+                error!("This is unexpected - falling back to 'unnamed-project'");
+                "unnamed-project"
+            });
+            let uid = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let temp_path = format!("/tmp/crunch-{}-{}", project_name, uid);
+            info!("Using temporary directory: {}", temp_path);
+            temp_path
+        }
+        RemotePathBehavior::Unique => {
+            // Create a unique persistent directory in the user's home directory
+            let project_name = project_dir.file_name().unwrap_or_else(|| {
+                error!(
+                    "Could not determine project name from workspace root: {}",
+                    project_dir
+                );
+                error!("This is unexpected - falling back to 'unnamed-project'");
+                "unnamed-project"
+            });
+            let unique_path = format!("~/crunch-builds/{}", project_name);
+
+            info!("Using unique persistent directory: {}", unique_path);
+            unique_path
+        }
+        RemotePathBehavior::Mirror => project_dir.to_string(),
+    };
+
+    log::log!(log::Level::Info, "Using build path: {}", build_path);
 
     info!("Transferring sources to remote: {}", build_path);
     let mut rsync_to = Command::new("rsync");
@@ -138,9 +190,11 @@ fn main() {
         rsync_to.arg("--exclude").arg(exclude);
     });
 
+    let rsync_path_arg = format!("mkdir -p {} && rsync", build_path);
+
     rsync_to
         .arg("--rsync-path")
-        .arg(format!("mkdir -p {} && rsync", build_path))
+        .arg(rsync_path_arg)
         .arg(format!("{}/", project_dir.to_string()))
         .arg(format!("{}:{}", build_server, build_path))
         .env("LC_ALL", "C.UTF-8")
@@ -253,6 +307,60 @@ fn main() {
                 eprintln!("{}", error);
             }
             exit(-6);
+        }
+    }
+
+    // Clean up temporary directory if we created one
+    if matches!(args.remote_path, RemotePathBehavior::Tmp) {
+        info!("Cleaning up temporary directory on remote server...");
+
+        // First run cargo clean to give user progress indicator for large target dirs
+        info!("Running cargo clean for progress indication...");
+        let cargo_clean_result = Command::new("ssh")
+            .args(&["-p", &remote.ssh_port.to_string()])
+            .arg(&build_server)
+            .arg(format!("cd '{}' && cargo clean", build_path))
+            .output();
+
+        match cargo_clean_result {
+            Ok(output) if output.status.success() => {
+                debug!("Successfully cleaned cargo artifacts");
+            }
+            Ok(output) => {
+                debug!(
+                    "cargo clean had non-zero exit (this is often fine): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(e) => {
+                debug!("Could not run cargo clean (error: {})", e);
+            }
+        }
+
+        // Then remove the temporary directory
+        let cleanup_result = Command::new("ssh")
+            .args(&["-p", &remote.ssh_port.to_string()])
+            .arg(&build_server)
+            .arg(format!("rm -r '{}'", build_path))
+            .output();
+
+        match cleanup_result {
+            Ok(output) if output.status.success() => {
+                debug!(
+                    "Successfully cleaned up temporary directory: {}",
+                    build_path
+                );
+            }
+            Ok(output) => {
+                debug!(
+                    "Warning: Failed to clean up temporary directory '{}': {}",
+                    build_path,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(e) => {
+                debug!("Warning: Could not run cleanup command (error: {})", e);
+            }
         }
     }
 }
